@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Sign in and open the controller dashboard",
+    "sanity": true,
+    "viewport": "desktop",
+    "covers": ["homepage navigation", "demo authentication", "protected dashboard", "ESP8266 controller status"],
+    "description": "Verifies the main entry page leads to sign-in and the supplied demo credentials open the controller dashboard.",
+    "steps": ["Open the homepage", "Open Sign in", "Enter username user and password user123", "Submit the form"],
+    "expected": "The dashboard opens and shows the VoiceHome Controller, voice command area, connected spaces, and system status cards."
+  },
+  {
+    "name": "Add a room and map it to an available GPIO",
+    "viewport": "desktop",
+    "covers": ["space management", "GPIO pin assignment", "duplicate GPIO guardrail", "dynamic room mapping"],
+    "description": "Verifies a user can add a new room through the web interface and map it to a free ESP8266 GPIO pin.",
+    "setup": ["Sign in as user with password user123"],
+    "steps": ["Open Spaces & GPIO", "Click Add space", "Enter Study Room and Study Room Bulb", "Select D1", "Enter study room, office as voice aliases", "Submit the form"],
+    "expected": "Study Room appears in the room mapping with Study Room Bulb, GPIO D1, and the configured voice aliases."
+  },
+  {
+    "name": "Control a configured room manually",
+    "viewport": "desktop",
+    "covers": ["manual device control", "queued device command", "backend device-command route", "poll-driven state refresh"],
+    "description": "Verifies a manual toggle queues a command in the database and the switch flips once the controller acknowledges it.",
+    "setup": ["Sign in as user with password user123"],
+    "steps": ["Open the dashboard", "Toggle the Sitting Room Bulb switch", "Wait for the status line to show the queued message", "Wait up to 8 seconds (3s device poll + 5s dashboard refresh)"],
+    "expected": "The status line shows 'queued — waiting for controller', the voice log lists the manual command as queued, and the switch flips to the new ON or OFF state after the controller acknowledges the command (requires the ESP8266 online or a simulated heartbeat ack)."
+  },
+  {
+    "name": "Reject invalid login",
+    "viewport": "mobile",
+    "covers": ["login validation", "authentication guardrail"],
+    "description": "Verifies incorrect credentials do not open the smart home dashboard.",
+    "steps": ["Open the sign-in page", "Enter username wrong and password wrong", "Submit the form"],
+    "expected": "An invalid username or password message is shown and the dashboard is not opened."
+  }
+]

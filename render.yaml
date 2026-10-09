@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: voicehome-control
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run start -- -H 0.0.0.0
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: 22.11.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DEVICE_API_KEY
+        sync: false
+      - key: API_BASE_URL
+        sync: false
