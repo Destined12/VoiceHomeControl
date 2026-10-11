@@ -94,6 +94,22 @@ const starterDevices: Device[] = starterRooms.map(room => ({
 
 const gpioPins = ['D1', 'D2', 'D5', 'D6', 'D7'];
 
+function statusLabel(status: string): string {
+  switch (status) {
+    case 'executed':
+      return 'success';
+    case 'pending':
+    case 'claimed':
+      return 'pending';
+    case 'failed':
+      return 'failed';
+    case 'expired':
+      return 'expired';
+    default:
+      return status;
+  }
+}
+
 export default function Dashboard() {
   const [listening, setListening] = useState(false);
   const [transcript, setTranscript] = useState('');
@@ -110,6 +126,7 @@ export default function Dashboard() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const activeCommandRef = useRef<{ id: string; action: string; device: string; pin?: string } | null>(null);
 
   const usedPins = useMemo(() => rooms.map(room => room.pin), [rooms]);
   const availablePins = gpioPins.filter(pin => !usedPins.includes(pin) || pin === roomForm.pin);
@@ -130,8 +147,27 @@ export default function Dashboard() {
           api.get<{ devices?: Device[] }>('/api/devices'),
         ]);
         if (cancelled) return;
-        setCommands(commandsRes.data.commands || []);
+        const fetchedCommands = commandsRes.data.commands || [];
+        setCommands(fetchedCommands);
         if (devicesRes.data.devices?.length) setDevices(devicesRes.data.devices);
+
+        const tracked = activeCommandRef.current;
+        if (tracked) {
+          const trackedCommand = fetchedCommands.find(command => command.id === tracked.id);
+          if (trackedCommand) {
+            if (trackedCommand.status === 'executed') {
+              setStatus(`${tracked.action} · ${tracked.device} — command successful`);
+              activeCommandRef.current = null;
+            } else if (trackedCommand.status === 'failed') {
+              setStatus(`${tracked.action} · ${tracked.device} — command failed`);
+              activeCommandRef.current = null;
+            } else if (trackedCommand.status === 'expired') {
+              setStatus(`${tracked.action} · ${tracked.device} — no controller response (timed out)`);
+              activeCommandRef.current = null;
+            }
+          }
+        }
+
         setSystemOnline(true);
       } catch {
         if (!cancelled) setSystemOnline(false);
@@ -246,8 +282,15 @@ export default function Dashboard() {
       };
       setCommands(prev => [entry, ...prev].slice(0, 25));
       if (result.device_id && result.action && result.action !== 'UNKNOWN') {
+        activeCommandRef.current = {
+          id: result.id,
+          action: result.action,
+          device: result.device ?? 'unknown',
+          pin: result.pin ?? undefined,
+        };
         setStatus(`Pending: ${result.action} · ${result.device} · ${result.pin} — device applies within 3s`);
       } else {
+        activeCommandRef.current = null;
         setStatus('Could not identify a configured room or action.');
       }
     } catch {
@@ -268,9 +311,15 @@ export default function Dashboard() {
 
   async function toggleDevice(device: Device) {
     const nextState = !device.state;
+    const action = nextState ? 'ON' : 'OFF';
     try {
-      await api.post<{ ok: boolean }>('/api/device-command', { device_id: device.id, action: nextState ? 'ON' : 'OFF' });
-      setStatus(`${device.name}: ${nextState ? 'ON' : 'OFF'} pending — waiting for controller…`);
+      const response = await api.post<{ ok: boolean; id?: string }>('/api/device-command', { device_id: device.id, action });
+      if (response.data?.id) {
+        activeCommandRef.current = { id: response.data.id, action, device: device.name, pin: device.pin };
+      } else {
+        activeCommandRef.current = null;
+      }
+      setStatus(`${device.name}: ${action} pending — waiting for controller…`);
     } catch {
       setStatus('Device command could not be delivered.');
     }
@@ -409,7 +458,7 @@ export default function Dashboard() {
                     <div className="history-row" key={command.id || i}>
                       <div className="history-icon"><Mic size={16} /></div>
                       <div className="history-main"><strong>{command.text}</strong><span>{command.device} · {command.action} · {new Date(command.created_at).toLocaleString()}</span></div>
-                      <span className="saved-pill"><CheckCircle2 size={14} /> {command.status}</span>
+                      <span className="saved-pill"><CheckCircle2 size={14} /> {statusLabel(command.status)}</span>
                     </div>
                   ))}
                 </div>

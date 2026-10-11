@@ -21,7 +21,7 @@
 
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 
 // =====================================
@@ -37,11 +37,11 @@ const char* WIFI_PASSWORD = "22334455";
 // =====================================
 
 // Origin only (no /api suffix, the code appends /api/... itself).
-// Use the PC's LAN IP, not localhost: the ESP8266 is another device.
-// Local dev value matches API_BASE_URL in .env.local.
+// Deployed Render service URL (HTTPS). For local dev, use the PC's LAN IP
+// instead, e.g. "http://192.168.72.142:3000".
 // Do not put the Neon database URL here.
 
-const char* API_BASE = "http://192.168.72.142:3000";
+const char* API_BASE = "https://voicehomecontrol.onrender.com";
 
 const char* CONTROLLER_ID = "VH-ESP8266-001";
 
@@ -50,9 +50,9 @@ const char* CONTROLLER_ID = "VH-ESP8266-001";
 
 const char* DEVICE_API_KEY = "vh_b502f6dd9560f557fbe10d93376b173318acf2dda2b4966fb08c22473dcee616";
 
-// Plain HTTP is used for the local dev backend (WiFiClient).
-// If you deploy behind HTTPS, replace WiFiClient with WiFiClientSecure
-// and call client.setInsecure() before http.begin(...).
+// The backend is served over HTTPS (Render), so requests use
+// WiFiClientSecure with setInsecure() to skip certificate validation.
+// For plain-HTTP local dev, swap these back to WiFiClient.
 
 // =====================================
 // 3. TIMING & INDICATOR SETTINGS
@@ -228,7 +228,8 @@ void connectWiFi() {
 void checkForCommand() {
   Serial.println("Checking backend for commands...");
 
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setInsecure();
 
   HTTPClient http;
 
@@ -244,7 +245,7 @@ void checkForCommand() {
     return;
   }
 
-  http.setTimeout(15000);
+  http.setTimeout(30000);
   http.addHeader("Authorization",
                  String("Bearer ") + DEVICE_API_KEY);
 
@@ -436,7 +437,8 @@ void acknowledgeCommand(
   bool success,
   const String& errorMessage
 ) {
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setInsecure();
 
   HTTPClient http;
 
@@ -452,7 +454,7 @@ void acknowledgeCommand(
     return;
   }
 
-  http.setTimeout(15000);
+  http.setTimeout(30000);
   http.addHeader("Authorization",
                  String("Bearer ") + DEVICE_API_KEY);
   http.addHeader("Content-Type", "application/json");
@@ -488,7 +490,8 @@ void acknowledgeCommand(
 void sendHeartbeat() {
   Serial.println("Sending heartbeat...");
 
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setInsecure();
 
   HTTPClient http;
 
@@ -500,7 +503,7 @@ void sendHeartbeat() {
     return;
   }
 
-  http.setTimeout(15000);
+  http.setTimeout(30000);
   http.addHeader("Authorization",
                  String("Bearer ") + DEVICE_API_KEY);
   http.addHeader("Content-Type", "application/json");
