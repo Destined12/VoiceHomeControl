@@ -70,6 +70,20 @@ unsigned long lastIndicatorUpdateMillis = 0;
 bool heartbeatEverSucceeded = false;
 bool indicatorLedState = false;
 
+// Holds a command acknowledgment until the polling request has fully
+// released its TLS context. Acknowledging inside checkForCommand() kept two
+// WiFiClientSecure objects alive at once, exhausting heap and causing the
+// ack POST to fail with HTTP: -1.
+
+struct PendingAck {
+  bool has;
+  String commandId;
+  bool success;
+  String error;
+};
+
+PendingAck pendingAck = { false, "", false, "" };
+
 // D8 system indicator (GPIO15)
 const int SYSTEM_LED_PIN = D8;
 const bool LED_ACTIVE_HIGH = true; // Set false if your LED circuit is active-low
@@ -172,6 +186,13 @@ void loop() {
     if (currentTime - lastPollTime >= POLL_INTERVAL) {
       lastPollTime = currentTime;
       checkForCommand();
+
+      // Acknowledge only after checkForCommand() returns, so its
+      // WiFiClientSecure has been destroyed before a new TLS connection starts.
+      if (pendingAck.has) {
+        acknowledgeCommand(pendingAck.commandId, pendingAck.success, pendingAck.error);
+        pendingAck.has = false;
+      }
     }
 
     // Send heartbeat every 10 seconds.
@@ -230,6 +251,7 @@ void checkForCommand() {
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setBufferSizes(512, 512);
 
   HTTPClient http;
 
@@ -264,12 +286,14 @@ void checkForCommand() {
       Serial.print("JSON error: ");
       Serial.println(error.c_str());
       http.end();
+      client.stop();
       return;
     }
 
     if (doc["command"].isNull()) {
       Serial.println("No pending command.");
       http.end();
+      client.stop();
       return;
     }
 
@@ -284,6 +308,7 @@ void checkForCommand() {
         action.length() == 0) {
       Serial.println("Invalid command received.");
       http.end();
+      client.stop();
       return;
     }
 
@@ -296,6 +321,7 @@ void checkForCommand() {
     Serial.println(action);
 
     http.end();
+    client.stop();
 
     executeCommand(pin.c_str(), action.c_str());
 
@@ -304,20 +330,18 @@ void checkForCommand() {
       action.equalsIgnoreCase("ON") ||
       action.equalsIgnoreCase("OFF");
 
-    if (relayNumber >= 1 && validAction) {
-      acknowledgeCommand(commandId, true, "");
-    } else {
-      acknowledgeCommand(
-        commandId,
-        false,
-        "Unsupported pin or action"
-      );
-    }
+    // Queue the ack for the main loop instead of sending it here. Sending it
+    // now would keep this request's TLS context alive alongside the ack's.
+    pendingAck.has = true;
+    pendingAck.commandId = commandId;
+    pendingAck.success = (relayNumber >= 1 && validAction);
+    pendingAck.error = pendingAck.success ? "" : "Unsupported pin or action";
 
   } else {
     Serial.print("Command request failed. HTTP: ");
     Serial.println(responseCode);
     http.end();
+    client.stop();
   }
 }
 
@@ -439,6 +463,7 @@ void acknowledgeCommand(
 ) {
   WiFiClientSecure client;
   client.setInsecure();
+  client.setBufferSizes(512, 512);
 
   HTTPClient http;
 
@@ -481,6 +506,7 @@ void acknowledgeCommand(
   }
 
   http.end();
+  client.stop();
 }
 
 // =====================================
@@ -492,6 +518,7 @@ void sendHeartbeat() {
 
   WiFiClientSecure client;
   client.setInsecure();
+  client.setBufferSizes(512, 512);
 
   HTTPClient http;
 
@@ -543,6 +570,7 @@ void sendHeartbeat() {
   }
 
   http.end();
+  client.stop();
 }
 
 // =====================================

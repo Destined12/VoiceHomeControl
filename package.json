@@ -8,14 +8,17 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "fetch-model": "node scripts/fetch-model.mjs"
   },
   "dependencies": {
+    "extract-zip": "^2.0.1",
     "lucide-react": "^0.469.0",
     "next": "^16.4.0",
     "pg": "^8.23.1",
     "react": "^19.0.0",
-    "react-dom": "^19.0.0"
+    "react-dom": "^19.0.0",
+    "vosk": "^0.3.39"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
