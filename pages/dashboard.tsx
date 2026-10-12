@@ -47,42 +47,6 @@ const api = {
   },
 };
 
-const VOSK_SAMPLE_RATE = 16000;
-
-function arrayBufferToBase64(bytes: Uint8Array): string {
-  let binary = '';
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize) as unknown as number[]);
-  }
-  return btoa(binary);
-}
-
-async function encodeClipForVosk(blob: Blob): Promise<string> {
-  const arrayBuffer = await blob.arrayBuffer();
-  const AudioContextCtor = (window as any).AudioContext || (window as any).webkitAudioContext;
-  const decodeContext = new AudioContextCtor();
-  try {
-    const decoded: AudioBuffer = await decodeContext.decodeAudioData(arrayBuffer.slice(0));
-    const frames = Math.max(1, Math.ceil(decoded.duration * VOSK_SAMPLE_RATE));
-    const offline = new OfflineAudioContext(1, frames, VOSK_SAMPLE_RATE);
-    const source = offline.createBufferSource();
-    source.buffer = decoded;
-    source.connect(offline.destination);
-    source.start();
-    const rendered = await offline.startRendering();
-    const channel = rendered.getChannelData(0);
-    const pcm = new Int16Array(channel.length);
-    for (let i = 0; i < channel.length; i++) {
-      const sample = Math.max(-1, Math.min(1, channel[i]));
-      pcm[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
-    }
-    return arrayBufferToBase64(new Uint8Array(pcm.buffer));
-  } finally {
-    if (typeof decodeContext.close === 'function') await decodeContext.close();
-  }
-}
-
 type Command = {
   id?: string;
   text: string;
@@ -162,7 +126,8 @@ export default function Dashboard() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const modeRef = useRef<'browser' | 'server' | null>(null);
+  const browserTranscriptRef = useRef('');
+  const finalizingRef = useRef(false);
   const activeCommandRef = useRef<{ id: string; action: string; device: string; pin?: string } | null>(null);
 
   const usedPins = useMemo(() => rooms.map(room => room.pin), [rooms]);
@@ -239,7 +204,90 @@ export default function Dashboard() {
     };
   }, []);
 
+  function blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        resolve(result.includes(',') ? result.slice(result.indexOf(',') + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function stopRecorderAndCollect(): Promise<Blob | null> {
+    return new Promise(resolve => {
+      const recorder = recorderRef.current;
+      if (!recorder || recorder.state === 'inactive') {
+        resolve(chunksRef.current.length ? new Blob(chunksRef.current, { type: 'audio/webm' }) : null);
+        return;
+      }
+      recorder.onstop = () => {
+        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
+        if (blob.size) setAudioUrl(URL.createObjectURL(blob));
+        resolve(blob.size ? blob : null);
+      };
+      try {
+        recorder.stop();
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+
+  async function transcribeWithGemini(blob: Blob): Promise<string> {
+    try {
+      const audioBase64 = await blobToBase64(blob);
+      const response = await api.post<{ text?: string }>('/api/transcribe', {
+        audioBase64,
+        mimeType: blob.type,
+      });
+      return (response.data?.text || '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  async function finalizeRecording() {
+    if (finalizingRef.current) return;
+    finalizingRef.current = true;
+    setListening(false);
+
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      try {
+        recognition.stop();
+      } catch {}
+      recognitionRef.current = null;
+    }
+
+    const blob = await stopRecorderAndCollect();
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    streamRef.current = null;
+
+    let text = '';
+    if (blob && blob.size > 0) {
+      setStatus('Transcribing with Gemini…');
+      text = await transcribeWithGemini(blob);
+    }
+    if (!text) {
+      text = (browserTranscriptRef.current || '').trim();
+      if (text) setStatus('Gemini unavailable — using the browser transcript.');
+    }
+
+    if (text) {
+      setTranscript(text);
+      await saveCommand(text);
+    } else {
+      setStatus('Couldn’t hear a command — please try again.');
+    }
+
+    finalizingRef.current = false;
+  }
+
   async function startRecording() {
+    if (finalizingRef.current) return;
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatus('Microphone access is not supported by this browser.');
       return;
@@ -248,93 +296,45 @@ export default function Dashboard() {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       chunksRef.current = [];
+      browserTranscriptRef.current = '';
+      finalizingRef.current = false;
+
       const recorder = new MediaRecorder(stream);
       recorderRef.current = recorder;
-
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      const useServer = !SpeechRecognition;
-      modeRef.current = useServer ? 'server' : 'browser';
-
       recorder.ondataavailable = e => { if (e.data.size) chunksRef.current.push(e.data); };
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        setAudioUrl(URL.createObjectURL(blob));
-        streamRef.current?.getTracks().forEach(t => t.stop());
-        if (useServer) transcribeWithServer(blob);
-      };
       recorder.start();
 
-      if (useServer) {
-        setListening(true);
-        setStatus('Listening… tap the mic again to transcribe on the server');
-        return;
-      }
+      setTranscript('');
+      setListening(true);
+      setStatus('Listening… speak your command');
+
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (!SpeechRecognition) return;
 
       const recognition = new SpeechRecognition();
       recognitionRef.current = recognition;
       recognition.lang = 'en-NG';
       recognition.continuous = false;
       recognition.interimResults = true;
-      recognition.onstart = () => {
-        setListening(true);
-        setStatus('Listening… speak your command');
-      };
       recognition.onresult = (event: any) => {
         const text = Array.from(event.results).map((r: any) => r[0].transcript).join('');
-        (recognition as any).finalTranscript = text;
+        browserTranscriptRef.current = text;
         setTranscript(text);
-        if (event.results[event.results.length - 1].isFinal) setStatus('Command recognized. Saving…');
+        if (event.results[event.results.length - 1].isFinal) setStatus('Command captured. Transcribing…');
       };
-      recognition.onerror = () => setStatus('Speech recognition error. Check microphone permission and try again.');
-      recognition.onend = () => {
-        setListening(false);
-        recorder.stop();
-        stream.getTracks().forEach(t => t.stop());
-        const finalText = recognitionRef.current?.finalTranscript || transcript.trim();
-        if (finalText) saveCommand(finalText);
-      };
-      (recognition as any).finalTranscript = '';
-      recognition.start();
+      recognition.onerror = () => {};
+      recognition.onend = () => { void finalizeRecording(); };
+      try {
+        recognition.start();
+      } catch {}
     } catch {
       setStatus('Microphone permission was denied or unavailable.');
+      setListening(false);
     }
   }
 
   function stopRecording() {
-    setListening(false);
-    if (modeRef.current === 'server') {
-      modeRef.current = null;
-      if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
-      return;
-    }
-    recognitionRef.current?.stop();
-    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
-  }
-
-  async function transcribeWithServer(blob: Blob) {
-    setStatus('Transcribing audio on the server…');
-    try {
-      const audio = await encodeClipForVosk(blob);
-      const response = await fetch('/api/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ audio, sampleRate: VOSK_SAMPLE_RATE }),
-      });
-      if (!response.ok) {
-        const payload = await response.json().catch(() => ({}));
-        setStatus(payload?.error || 'Server transcription failed. Please try again.');
-        return;
-      }
-      const { text } = (await response.json()) as { text?: string };
-      if (text) {
-        setTranscript(text);
-        saveCommand(text);
-      } else {
-        setStatus('No speech detected. Try again a little closer to the mic.');
-      }
-    } catch {
-      setStatus('Could not reach the transcription service.');
-    }
+    void finalizeRecording();
   }
 
   async function saveCommand(text: string) {
