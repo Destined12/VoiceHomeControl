@@ -1,5 +1,6 @@
 import Head from 'next/head';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { startMicSession, type MicSessionController } from '../lib/voice-service';
 import {
   Mic,
   MicOff,
@@ -121,13 +122,8 @@ export default function Dashboard() {
   const [showAddRoom, setShowAddRoom] = useState(false);
   const [roomForm, setRoomForm] = useState({ name: '', deviceName: '', pin: 'D1', aliases: '' });
   const [systemOnline, setSystemOnline] = useState(true);
-  const [audioUrl, setAudioUrl] = useState('');
-  const recognitionRef = useRef<any>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const browserTranscriptRef = useRef('');
-  const finalizingRef = useRef(false);
+  const ctrlRef = useRef<MicSessionController | null>(null);
+  const busyRef = useRef(false);
   const activeCommandRef = useRef<{ id: string; action: string; device: string; pin?: string } | null>(null);
 
   const usedPins = useMemo(() => rooms.map(room => room.pin), [rooms]);
@@ -200,141 +196,68 @@ export default function Dashboard() {
       if (debounceTimer) clearTimeout(debounceTimer);
       clearInterval(fallbackTimer);
       eventSource.close();
-      streamRef.current?.getTracks().forEach(t => t.stop());
+      ctrlRef.current?.cancel();
     };
   }, []);
 
-  function blobToBase64(blob: Blob): Promise<string> {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const result = reader.result as string;
-        resolve(result.includes(',') ? result.slice(result.indexOf(',') + 1) : result);
-      };
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(blob);
-    });
-  }
-
-  function stopRecorderAndCollect(): Promise<Blob | null> {
-    return new Promise(resolve => {
-      const recorder = recorderRef.current;
-      if (!recorder || recorder.state === 'inactive') {
-        resolve(chunksRef.current.length ? new Blob(chunksRef.current, { type: 'audio/webm' }) : null);
-        return;
-      }
-      recorder.onstop = () => {
-        const blob = new Blob(chunksRef.current, { type: recorder.mimeType || 'audio/webm' });
-        if (blob.size) setAudioUrl(URL.createObjectURL(blob));
-        resolve(blob.size ? blob : null);
-      };
-      try {
-        recorder.stop();
-      } catch {
-        resolve(null);
-      }
-    });
-  }
-
-  async function transcribeWithGemini(blob: Blob): Promise<string> {
+  function startVoice() {
+    if (busyRef.current) return;
+    busyRef.current = true;
+    setTranscript('');
+    setListening(true);
+    setStatus('Connecting…');
     try {
-      const audioBase64 = await blobToBase64(blob);
-      const response = await api.post<{ text?: string }>('/api/transcribe', {
-        audioBase64,
-        mimeType: blob.type,
+      ctrlRef.current = startMicSession({
+        onInterim: text => setTranscript(text),
+        onFinal: text => {
+          setTranscript(text);
+          if (text) {
+            setStatus('Command captured.');
+            void saveCommand(text);
+          } else {
+            setStatus('Couldn’t hear a command — please try again.');
+          }
+          busyRef.current = false;
+          setListening(false);
+          ctrlRef.current = null;
+        },
+        onStatus: (voiceStatus, message) => {
+          if (voiceStatus === 'connecting') {
+            setStatus('Connecting…');
+          } else if (voiceStatus === 'listening') {
+            setListening(true);
+            setStatus('Listening… speak your command');
+          } else if (voiceStatus === 'finalizing') {
+            setStatus('Finalizing transcription…');
+          } else if (voiceStatus === 'cancelled') {
+            setListening(false);
+            setStatus(message || 'Recording cancelled.');
+            busyRef.current = false;
+            ctrlRef.current = null;
+          } else if (voiceStatus === 'error') {
+            setListening(false);
+            setStatus(message || 'Voice recognition failed.');
+            busyRef.current = false;
+            ctrlRef.current = null;
+          } else if (voiceStatus === 'stopped') {
+            setListening(false);
+            ctrlRef.current = null;
+          }
+        },
       });
-      return (response.data?.text || '').trim();
     } catch {
-      return '';
-    }
-  }
-
-  async function finalizeRecording() {
-    if (finalizingRef.current) return;
-    finalizingRef.current = true;
-    setListening(false);
-
-    const recognition = recognitionRef.current;
-    if (recognition) {
-      try {
-        recognition.stop();
-      } catch {}
-      recognitionRef.current = null;
-    }
-
-    const blob = await stopRecorderAndCollect();
-    streamRef.current?.getTracks().forEach(t => t.stop());
-    streamRef.current = null;
-
-    let text = '';
-    if (blob && blob.size > 0) {
-      setStatus('Transcribing with Gemini…');
-      text = await transcribeWithGemini(blob);
-    }
-    if (!text) {
-      text = (browserTranscriptRef.current || '').trim();
-      if (text) setStatus('Gemini unavailable — using the browser transcript.');
-    }
-
-    if (text) {
-      setTranscript(text);
-      await saveCommand(text);
-    } else {
-      setStatus('Couldn’t hear a command — please try again.');
-    }
-
-    finalizingRef.current = false;
-  }
-
-  async function startRecording() {
-    if (finalizingRef.current) return;
-    if (!navigator.mediaDevices?.getUserMedia) {
-      setStatus('Microphone access is not supported by this browser.');
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      chunksRef.current = [];
-      browserTranscriptRef.current = '';
-      finalizingRef.current = false;
-
-      const recorder = new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      recorder.ondataavailable = e => { if (e.data.size) chunksRef.current.push(e.data); };
-      recorder.start();
-
-      setTranscript('');
-      setListening(true);
-      setStatus('Listening… speak your command');
-
-      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognition) return;
-
-      const recognition = new SpeechRecognition();
-      recognitionRef.current = recognition;
-      recognition.lang = 'en-NG';
-      recognition.continuous = false;
-      recognition.interimResults = true;
-      recognition.onresult = (event: any) => {
-        const text = Array.from(event.results).map((r: any) => r[0].transcript).join('');
-        browserTranscriptRef.current = text;
-        setTranscript(text);
-        if (event.results[event.results.length - 1].isFinal) setStatus('Command captured. Transcribing…');
-      };
-      recognition.onerror = () => {};
-      recognition.onend = () => { void finalizeRecording(); };
-      try {
-        recognition.start();
-      } catch {}
-    } catch {
-      setStatus('Microphone permission was denied or unavailable.');
+      busyRef.current = false;
       setListening(false);
+      setStatus('Could not start voice recognition.');
     }
   }
 
-  function stopRecording() {
-    void finalizeRecording();
+  function stopVoice() {
+    ctrlRef.current?.stop();
+  }
+
+  function cancelVoice() {
+    ctrlRef.current?.cancel();
   }
 
   async function saveCommand(text: string) {
@@ -492,13 +415,17 @@ export default function Dashboard() {
                   <div className={listening ? 'listening-badge active' : 'listening-badge'}><Radio size={15} /> {listening ? 'Listening' : 'Ready'}</div>
                 </div>
                 <div className="voice-zone">
-                  <button className={listening ? 'mic-button active' : 'mic-button'} onClick={listening ? stopRecording : startRecording} aria-label={listening ? 'Stop listening' : 'Start voice command'}>
+                  <button className={listening ? 'mic-button active' : 'mic-button'} onClick={listening ? stopVoice : startVoice} aria-label={listening ? 'Stop listening' : 'Start voice command'}>
                     {listening ? <MicOff size={36} /> : <Mic size={36} />}
                   </button>
+                  {listening && (
+                    <div style={{ marginTop: 12 }}>
+                      <button className="outline-btn" onClick={cancelVoice} aria-label="Cancel recording"><X size={15} /> Cancel</button>
+                    </div>
+                  )}
                   <div className="voice-text">{transcript || 'Try “Turn on the sitting room bulb”'}</div>
                   <div className="wave large-wave">{[1,2,3,4,5,6,7,8,9,10,11].map(i => <i key={i} />)}</div>
                   <div className="status-line"><Volume2 size={15} /> {status}</div>
-                  {audioUrl && <audio className="audio-player" controls src={audioUrl} />}
                 </div>
               </section>
 
