@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { ensureSchema, errorMessage, query } from '../../lib/db';
+import { ensureSchema, errorMessage, expireStaleClaims, query } from '../../lib/db';
 import { resolveCommand, type ResolveDevice } from '../../lib/resolve';
 import { emitChange } from '../../lib/events';
 
@@ -18,6 +18,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   if (req.method === 'GET') {
     try {
       await ensureSchema();
+      const expired = await expireStaleClaims(Date.now());
+      if (expired > 0) {
+        emitChange('commands');
+      }
       const result = await query<CommandRow>(
         `SELECT id, text, device, device_id, action, status, created_at, audio_received
          FROM voice_commands

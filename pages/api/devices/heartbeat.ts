@@ -20,6 +20,12 @@ type QueuedCommand = {
   pin: string;
 };
 
+// NOTE: The ESP8266 firmware does not call this route. It uses
+// /api/controllers/heartbeat/ for presence and /api/controllers/{id}/commands/
+// for claiming. This endpoint is retained for compatibility but is not part of
+// the active command lifecycle. STALE_MS below is a legacy command-expiry value;
+// authoritative command expiry now lives in lib/db.ts (expireStaleClaims). Do not
+// repurpose this constant for device-presence detection.
 const STALE_MS = 5 * 60 * 1000;
 const CLAIM_TIMEOUT_MS = 60 * 1000;
 

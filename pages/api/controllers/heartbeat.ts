@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { ensureSchema, errorMessage, query } from '../../../lib/db';
+import { ensureSchema, errorMessage, expireStaleClaims, query } from '../../../lib/db';
 import { requireDeviceKey } from '../../../lib/auth';
 import { emitChange } from '../../../lib/events';
 
@@ -22,6 +22,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   try {
     await ensureSchema();
     const now = Date.now();
+
+    const expired = await expireStaleClaims(now);
+    if (expired > 0) {
+      emitChange('commands');
+    }
+
     if (body.controller_id) {
       await query(
         `UPDATE devices

@@ -18,6 +18,7 @@ import {
   X,
   Trash2,
   ChevronDown,
+  XCircle,
 } from 'lucide-react';
 
 async function apiRequest<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: unknown): Promise<{ data: T }> {
@@ -106,6 +107,8 @@ function statusLabel(status: string): string {
       return 'failed';
     case 'expired':
       return 'expired';
+    case 'cancelled':
+      return 'cancelled';
     default:
       return status;
   }
@@ -122,9 +125,12 @@ export default function Dashboard() {
   const [showAddRoom, setShowAddRoom] = useState(false);
   const [roomForm, setRoomForm] = useState({ name: '', deviceName: '', pin: 'D1', aliases: '' });
   const [systemOnline, setSystemOnline] = useState(true);
+  const [cancellingIds, setCancellingIds] = useState<string[]>([]);
   const ctrlRef = useRef<MicSessionController | null>(null);
   const busyRef = useRef(false);
   const activeCommandRef = useRef<{ id: string; action: string; device: string; pin?: string } | null>(null);
+  const refreshRef = useRef<() => Promise<void>>(async () => {});
+  const refreshInFlightRef = useRef(false);
 
   const usedPins = useMemo(() => rooms.map(room => room.pin), [rooms]);
   const availablePins = gpioPins.filter(pin => !usedPins.includes(pin) || pin === roomForm.pin);
@@ -139,6 +145,8 @@ export default function Dashboard() {
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
 
     async function refresh() {
+      if (refreshInFlightRef.current) return;
+      refreshInFlightRef.current = true;
       try {
         const [commandsRes, devicesRes] = await Promise.all([
           api.get<{ commands?: Command[] }>('/api/commands'),
@@ -162,6 +170,9 @@ export default function Dashboard() {
             } else if (trackedCommand.status === 'expired') {
               setStatus(`${tracked.action} · ${tracked.device} — no controller response (timed out)`);
               activeCommandRef.current = null;
+            } else if (trackedCommand.status === 'cancelled') {
+              setStatus(`${tracked.action} · ${tracked.device} — command cancelled`);
+              activeCommandRef.current = null;
             }
           }
         }
@@ -169,9 +180,12 @@ export default function Dashboard() {
         setSystemOnline(true);
       } catch {
         if (!cancelled) setSystemOnline(false);
+      } finally {
+        refreshInFlightRef.current = false;
       }
     }
 
+    refreshRef.current = refresh;
     refresh();
 
     const eventSource = new EventSource('/api/events/');
@@ -199,6 +213,18 @@ export default function Dashboard() {
       ctrlRef.current?.cancel();
     };
   }, []);
+
+  const hasActiveCommands = commands.some(
+    command => command.status === 'pending' || command.status === 'claimed' || command.status === 'queued'
+  );
+
+  useEffect(() => {
+    if (!hasActiveCommands) return;
+    const timer = setInterval(() => {
+      void refreshRef.current();
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [hasActiveCommands]);
 
   function startVoice() {
     if (busyRef.current) return;
@@ -296,13 +322,36 @@ export default function Dashboard() {
   }
 
   async function clearLog() {
-    if (!window.confirm('Clear the voice log? This deletes all stored commands.')) return;
+    if (!window.confirm('Reset all data? This deletes every command and resets rooms/devices to defaults.')) return;
     try {
-      await api.delete('/api/commands');
+      await api.post('/api/reset');
       setCommands([]);
-      setStatus('Voice log cleared.');
+      setDevices(starterDevices);
+      setRooms(starterRooms);
+      activeCommandRef.current = null;
+      setStatus('All data reset to defaults.');
     } catch {
-      setStatus('Could not clear the voice log.');
+      setStatus('Could not reset the data.');
+    }
+  }
+
+  async function cancelCommand(id?: string) {
+    if (!id || cancellingIds.includes(id)) return;
+    setCancellingIds(prev => [...prev, id]);
+    setStatus('Cancelling command…');
+    try {
+      const response = await api.post<{ ok: boolean; status: string; error?: string }>(`/api/commands/${id}/cancel/`);
+      const result = response.data;
+      if (result?.status === 'cancelled') {
+        setStatus('Command cancelled.');
+      } else {
+        setStatus(result?.error || `Command is ${result?.status ?? 'unchanged'} and could not be cancelled.`);
+      }
+    } catch {
+      setStatus('Could not cancel the command.');
+    } finally {
+      setCancellingIds(prev => prev.filter(item => item !== id));
+      void refreshRef.current();
     }
   }
 
@@ -453,15 +502,24 @@ export default function Dashboard() {
               </section>
 
               <section className="history-section">
-                <div className="section-head"><div><span className="section-label">VOICE LOG</span><h2>Recent commands</h2></div><button className="outline-btn" onClick={clearLog} disabled={commands.length === 0}><Trash2 size={15} /> Clear log</button></div>
+                <div className="section-head"><div><span className="section-label">VOICE LOG</span><h2>Recent commands</h2></div><button className="outline-btn" onClick={clearLog} disabled={commands.length === 0}><Trash2 size={15} /> Reset data</button></div>
                 <div className="history-list">
-                  {commands.length === 0 ? <div className="empty-history"><Clock3 size={20} /> Your voice commands will appear here.</div> : commands.map((command, i) => (
-                    <div className="history-row" key={command.id || i}>
-                      <div className="history-icon"><Mic size={16} /></div>
-                      <div className="history-main"><strong>{command.text}</strong><span>{command.device} · {command.action} · {new Date(command.created_at).toLocaleString()}</span></div>
-                      <span className="saved-pill"><CheckCircle2 size={14} /> {statusLabel(command.status)}</span>
-                    </div>
-                  ))}
+                  {commands.length === 0 ? <div className="empty-history"><Clock3 size={20} /> Your voice commands will appear here.</div> : commands.map((command, i) => {
+                    const cancellable = command.status === 'pending' || command.status === 'queued';
+                    const busy = !!command.id && cancellingIds.includes(command.id);
+                    return (
+                      <div className="history-row" key={command.id || i}>
+                        <div className="history-icon"><Mic size={16} /></div>
+                        <div className="history-main"><strong>{command.text}</strong><span>{command.device} · {command.action} · {new Date(command.created_at).toLocaleString()}</span></div>
+                        <span className="saved-pill"><CheckCircle2 size={14} /> {statusLabel(command.status)}</span>
+                        {cancellable && (
+                          <button className="cancel-btn" onClick={() => cancelCommand(command.id)} disabled={busy} aria-label="Cancel command">
+                            <XCircle size={13} /> {busy ? 'Cancelling…' : 'Cancel'}
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               </section>
             </>

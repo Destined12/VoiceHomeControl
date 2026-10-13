@@ -1,5 +1,11 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
-import { ensureSchema, errorMessage, query } from '../../../../lib/db';
+import {
+  ensureSchema,
+  errorMessage,
+  expireStaleClaims,
+  query,
+  COMMAND_CLAIM_TTL_MS,
+} from '../../../../lib/db';
 import { requireDeviceKey } from '../../../../lib/auth';
 import { emitChange } from '../../../../lib/events';
 
@@ -8,8 +14,6 @@ type PendingCommand = {
   pin: string | null;
   action: string;
 };
-
-const CLAIM_TIMEOUT_MS = 60 * 1000;
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   const { controllerId } = req.query;
@@ -27,17 +31,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       await ensureSchema();
       const now = Date.now();
 
-      const released = await query(
-        `UPDATE voice_commands vc
-         SET status = 'pending', claimed_at = NULL, claimed_by = NULL
-         FROM devices d
-         WHERE vc.device_id = d.id
-           AND vc.status = 'claimed'
-           AND vc.claimed_at IS NOT NULL
-           AND ($1 - vc.claimed_at) > $2
-         RETURNING vc.id`,
-        [now, CLAIM_TIMEOUT_MS]
-      );
+      const expired = await expireStaleClaims(now);
+      if (expired > 0) {
+        emitChange('commands');
+      }
 
       const claimed = await query<PendingCommand>(
         `UPDATE voice_commands vc
@@ -48,7 +45,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
            JOIN devices d ON d.id = vc.device_id
            WHERE vc.status = 'pending'
              AND d.pin IS NOT NULL
-             AND (d.controller_id IS NULL OR LOWER(d.controller_id) = LOWER($2) OR $2 = $2)
+             AND vc.created_at > $3
+             AND (d.controller_id IS NULL OR LOWER(d.controller_id) = LOWER($2))
            ORDER BY vc.id
            FOR UPDATE SKIP LOCKED
            LIMIT 1
@@ -56,7 +54,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
          JOIN devices d ON d.id = (SELECT device_id FROM voice_commands WHERE id = picked.id)
          WHERE vc.id = picked.id
          RETURNING vc.id, vc.pin, vc.action, d.id AS device_id`,
-        [now, controllerId]
+        [now, controllerId, now - COMMAND_CLAIM_TTL_MS]
       );
 
       if (claimed.rows.length === 0) {

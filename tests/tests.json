@@ -33,5 +33,93 @@
     "description": "Verifies incorrect credentials do not open the smart home dashboard.",
     "steps": ["Open the sign-in page", "Enter username wrong and password wrong", "Submit the form"],
     "expected": "An invalid username or password message is shown and the dashboard is not opened."
+  },
+  {
+    "name": "Pending command expires if not claimed within 15 seconds",
+    "viewport": "desktop",
+    "covers": ["claim deadline", "expireStaleClaims stage A", "controller polling expiry sweep"],
+    "description": "Verifies a command that no controller claims within the 15 second claim deadline is marked expired and can never execute.",
+    "setup": ["Sign in as user with password user123", "Ensure the ESP8266 is offline (or no controller polls the endpoint)"],
+    "steps": ["Toggle a device to queue a pending command", "Record its id from the voice log", "Wait at least 16 seconds", "Query the command status via GET /api/commands"],
+    "expected": "The command status is 'expired' after the claim deadline and is not returned to any controller as a command to execute."
+  },
+  {
+    "name": "Claimed command expires if not acknowledged within 25 seconds",
+    "viewport": "desktop",
+    "covers": ["execution deadline", "expireStaleClaims stage B", "late acknowledgement guard"],
+    "description": "Verifies a command that was claimed but never acknowledged within the 25 second execution deadline is expired, and a late acknowledgement cannot revive it or mark it executed.",
+    "setup": ["Sign in as user with password user123", "Have a controller claim a command but withhold the acknowledgement"],
+    "steps": ["Queue a command and let a controller claim it (status 'claimed')", "Do not send an acknowledgement", "Wait more than 25 seconds from creation", "Send a late acknowledgement for the same command id"],
+    "expected": "The command status is 'expired'; the late acknowledgement returns { ok: false, status: 'expired' } and the command is not marked executed."
+  },
+  {
+    "name": "Expiry sweeps are idempotent and report correct counts",
+    "viewport": "desktop",
+    "covers": ["expiry idempotency", "affected-row counts"],
+    "description": "Verifies running the shared expiry helper repeatedly does not re-expire already terminal rows and returns zero affected rows once everything is expired.",
+    "setup": ["Two commands older than their deadlines exist as pending/claimed"],
+    "steps": ["Call the expiry sweep once", "Call the expiry sweep again", "Compare affected-row counts"],
+    "expected": "The first sweep changes only the eligible stale rows; the second sweep changes zero rows."
+  },
+  {
+    "name": "Cancel a pending command immediately",
+    "viewport": "desktop",
+    "covers": ["immediate cancellation endpoint", "atomic conditional update", "dashboard cancel action"],
+    "description": "Verifies a pending command can be cancelled via the authenticated cancel endpoint and the dashboard reflects the cancelled state.",
+    "setup": ["Sign in as user with password user123", "Queue a pending command"],
+    "steps": ["Click Cancel on the pending command in the voice log", "Observe the status line and the command row"],
+    "expected": "POST /api/commands/{id}/cancel/ returns { ok: true, status: 'cancelled' }, the row shows 'cancelled', and the controller never receives the command."
+  },
+  {
+    "name": "Cancellation is safe against terminal states and late acknowledgements",
+    "viewport": "desktop",
+    "covers": ["terminal state protection", "repeat cancellation", "ack cannot revive cancelled"],
+    "description": "Verifies that repeated cancellation, cancelling an executed command, and a late acknowledgement cannot overwrite a terminal state.",
+    "steps": ["Cancel a pending command", "Call cancel again for the same command", "Attempt to cancel an executed command", "Send a late acknowledgement for the cancelled command"],
+    "expected": "The second cancel does not change state and returns the actual status; executed commands are not overwritten; the late acknowledgement cannot revive the cancelled command."
+  },
+  {
+    "name": "Cancelling a claimed command reports that the action may have occurred",
+    "viewport": "desktop",
+    "covers": ["claimed cancellation guard", "protocol limitation reporting"],
+    "description": "Verifies a claimed command cannot be silently cancelled and the API explains that the physical action cannot be guaranteed to be prevented.",
+    "setup": ["Have a controller claim a command"],
+    "steps": ["Call POST /api/commands/{id}/cancel/ for the claimed command"],
+    "expected": "The endpoint returns HTTP 409 with the actual status 'claimed' and a message stating the physical action cannot be guaranteed to be prevented."
+  },
+  {
+    "name": "Refreshing the dashboard does not resubmit or execute old commands",
+    "viewport": "desktop",
+    "covers": ["no auto-submit on mount", "authoritative database state", "stale command safety"],
+    "description": "Verifies that reloading the dashboard never creates a new command and that old pending commands are expired rather than re-executed.",
+    "setup": ["Queue a pending command", "Leave it unclaimed past the claim deadline"],
+    "steps": ["Reload the dashboard several times", "Observe the voice log and the network requests"],
+    "expected": "No new command is POSTed on mount, the old command shows 'expired', and no command is executed as a result of the reload."
+  },
+  {
+    "name": "Reset data clears commands and restores default rooms",
+    "viewport": "desktop",
+    "covers": ["reset endpoint", "log separation", "device reseeding"],
+    "description": "Verifies the Reset data action clears commands and reseeds the default devices/rooms without executing anything.",
+    "setup": ["Sign in as user with password user123"],
+    "steps": ["Queue at least one command", "Click Reset data and confirm", "Reload the dashboard"],
+    "expected": "The voice log is empty, the four default rooms/devices are restored, and no command was executed by the reset."
+  },
+  {
+    "name": "Five-second refresh runs only while active commands exist",
+    "viewport": "desktop",
+    "covers": ["conditional polling interval", "timer cleanup", "no overlapping refresh"],
+    "description": "Verifies the dashboard polls approximately every five seconds only while at least one pending or claimed command exists, and stops otherwise.",
+    "setup": ["Sign in as user with password user123"],
+    "steps": ["Queue a pending command", "Observe GET /api/commands requests over ten seconds", "Cancel or resolve the command", "Observe requests over another ten seconds"],
+    "expected": "Requests occur roughly every five seconds while an active command exists and stop once no pending/claimed commands remain; no overlapping refresh requests are issued."
+  },
+  {
+    "name": "Concurrent controller polls cannot claim the same command twice",
+    "viewport": "desktop",
+    "covers": ["atomic claiming", "FOR UPDATE SKIP LOCKED", "single execution"],
+    "description": "Verifies that two concurrent poll requests result in exactly one claim of a single pending command.",
+    "steps": ["Queue one pending command", "Issue two controller poll requests concurrently", "Inspect how many responses include the command"],
+    "expected": "Exactly one poll response contains the command; the other returns { command: null }, and the command is executed at most once."
   }
 ]

@@ -1,5 +1,8 @@
 import { Pool, QueryResult, QueryResultRow } from 'pg';
 
+export const COMMAND_CLAIM_TTL_MS = 15 * 1000;
+export const COMMAND_EXECUTION_TTL_MS = 25 * 1000;
+
 type SeedDevice = {
   id: string;
   name: string;
@@ -10,7 +13,7 @@ type SeedDevice = {
   pin: string;
 };
 
-const STARTER_DEVICES: SeedDevice[] = [
+export const STARTER_DEVICES: SeedDevice[] = [
   { id: 'sitting-room-bulb', name: 'Sitting Room Bulb', location: 'Sitting Room', state: false, online: true, last_seen: Date.now(), pin: 'D2' },
   { id: 'sitting-room-socket', name: 'Sitting Room Socket', location: 'Sitting Room', state: false, online: true, last_seen: Date.now(), pin: 'D5' },
   { id: 'master-bedroom-bulb', name: 'Master Bedroom Bulb', location: 'Bedroom', state: false, online: true, last_seen: Date.now(), pin: 'D6' },
@@ -30,6 +33,25 @@ function getPool(): Pool {
     });
   }
   return pool;
+}
+
+async function seedStarterDevices(db: Pool, now: number): Promise<void> {
+  for (const device of STARTER_DEVICES) {
+    await db.query(
+      `INSERT INTO devices (id, name, location, state, online, last_seen, heartbeat_at, pin)
+       VALUES ($1, $2, $3, FALSE, TRUE, $4, $4, $5)
+       ON CONFLICT (id) DO NOTHING`,
+      [device.id, device.name, device.location, now, device.pin]
+    );
+  }
+  await db.query(`
+    UPDATE devices
+    SET aliases = CASE location
+      WHEN 'Sitting Room' THEN 'sitting room, living room, parlour'
+      WHEN 'Bedroom' THEN 'bedroom, master bedroom'
+    END
+    WHERE aliases IS NULL
+  `);
 }
 
 let schemaPromise: Promise<void> | null = null;
@@ -93,22 +115,7 @@ export function ensureSchema(): Promise<void> {
         END
         WHERE status IN ('queued', 'applied')
       `);
-      await db.query(`
-        UPDATE devices
-        SET aliases = CASE location
-          WHEN 'Sitting Room' THEN 'sitting room, living room, parlour'
-          WHEN 'Bedroom' THEN 'bedroom, master bedroom'
-        END
-        WHERE aliases IS NULL
-      `);
-      for (const device of STARTER_DEVICES) {
-        await db.query(
-          `INSERT INTO devices (id, name, location, state, online, last_seen, heartbeat_at, pin)
-           VALUES ($1, $2, $3, $4, $5, $6, $6, $7)
-           ON CONFLICT (id) DO NOTHING`,
-          [device.id, device.name, device.location, device.state, device.online, device.last_seen, device.pin]
-        );
-      }
+      await seedStarterDevices(db, Date.now());
       await db.query(`
         UPDATE devices
         SET pin = CASE id
@@ -124,6 +131,21 @@ export function ensureSchema(): Promise<void> {
       `);
       await db.query(`DELETE FROM devices WHERE id = 'bedroom-socket'`);
       await db.query(`UPDATE devices SET heartbeat_at = last_seen WHERE heartbeat_at IS NULL`);
+      await db.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'voice_commands_status_check'
+          ) THEN
+            ALTER TABLE voice_commands
+              ADD CONSTRAINT voice_commands_status_check
+              CHECK (status IN (
+                'pending', 'queued', 'claimed', 'executed',
+                'failed', 'expired', 'cancelled', 'unresolved'
+              ));
+          END IF;
+        END $$;
+      `);
     })();
     schemaPromise.catch(() => {
       schemaPromise = null;
@@ -141,4 +163,30 @@ export function query<T extends QueryResultRow = QueryResultRow>(
 
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Unexpected database error';
+}
+
+export async function expireStaleClaims(now: number = Date.now()): Promise<number> {
+  const claim = await query(
+    `UPDATE voice_commands SET status = 'expired'
+     WHERE status IN ('pending', 'queued') AND created_at < $1`,
+    [now - COMMAND_CLAIM_TTL_MS]
+  );
+  const execution = await query(
+    `UPDATE voice_commands SET status = 'expired'
+     WHERE status = 'claimed' AND created_at < $1`,
+    [now - COMMAND_EXECUTION_TTL_MS]
+  );
+  return (claim.rowCount ?? 0) + (execution.rowCount ?? 0);
+}
+
+export async function resetAllData(): Promise<{ commands: number; devices: number }> {
+  await ensureSchema();
+  const db = getPool();
+  const cleared = await db.query(`DELETE FROM voice_commands`);
+  await db.query(`DELETE FROM devices`);
+  await seedStarterDevices(db, Date.now());
+  return {
+    commands: cleared.rowCount ?? 0,
+    devices: STARTER_DEVICES.length,
+  };
 }
