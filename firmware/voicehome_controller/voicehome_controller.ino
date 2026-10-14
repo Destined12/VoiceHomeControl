@@ -62,6 +62,12 @@ const unsigned long POLL_INTERVAL = 3000;
 const unsigned long HEARTBEAT_INTERVAL = 10000;
 const unsigned long HEARTBEAT_TIMEOUT = 30000; // 30 seconds
 
+// Delay before (re)sending an acknowledgment. Waiting a couple of seconds on a
+// later loop pass lets the polling request's TLS context be fully released
+// before a new WiFiClientSecure is created, which prevents the HTTP: -1
+// connection failure caused by two TLS sessions fighting for the same heap.
+const unsigned long ACK_RETRY_INTERVAL = 2000;
+
 unsigned long lastPollTime = 0;
 unsigned long lastHeartbeatTime = 0;
 unsigned long lastHeartbeatSuccessMillis = 0;
@@ -71,18 +77,19 @@ bool heartbeatEverSucceeded = false;
 bool indicatorLedState = false;
 
 // Holds a command acknowledgment until the polling request has fully
-// released its TLS context. Acknowledging inside checkForCommand() kept two
-// WiFiClientSecure objects alive at once, exhausting heap and causing the
-// ack POST to fail with HTTP: -1.
+// released its TLS context. The ack is retried on later loop passes and only
+// cleared once the backend accepts it, so a transient HTTP: -1 (connection
+// refused) no longer drops the acknowledgment and leaves the command to expire.
 
 struct PendingAck {
   bool has;
   String commandId;
   bool success;
   String error;
+  unsigned long lastAttempt;
 };
 
-PendingAck pendingAck = { false, "", false, "" };
+PendingAck pendingAck = { false, "", false, "", 0 };
 
 // D8 system indicator (GPIO15)
 const int SYSTEM_LED_PIN = D8;
@@ -127,7 +134,7 @@ void checkForCommand();
 void sendHeartbeat();
 void updateSystemIndicator();
 void executeCommand(const char* pin, const char* action);
-void acknowledgeCommand(
+bool acknowledgeCommand(
   const String& commandId,
   bool success,
   const String& errorMessage
@@ -186,12 +193,19 @@ void loop() {
     if (currentTime - lastPollTime >= POLL_INTERVAL) {
       lastPollTime = currentTime;
       checkForCommand();
+    }
 
-      // Acknowledge only after checkForCommand() returns, so its
-      // WiFiClientSecure has been destroyed before a new TLS connection starts.
-      if (pendingAck.has) {
-        acknowledgeCommand(pendingAck.commandId, pendingAck.success, pendingAck.error);
+    // Acknowledge on a later loop pass, once the poll's TLS context has been
+    // fully released, and keep retrying until the backend accepts it. The ack
+    // is only cleared on success so an HTTP: -1 failure is not lost.
+    if (pendingAck.has &&
+        currentTime - pendingAck.lastAttempt >= ACK_RETRY_INTERVAL) {
+      pendingAck.lastAttempt = currentTime;
+
+      if (acknowledgeCommand(pendingAck.commandId, pendingAck.success, pendingAck.error)) {
         pendingAck.has = false;
+      } else {
+        Serial.println("Acknowledgment not accepted; will retry.");
       }
     }
 
@@ -336,6 +350,7 @@ void checkForCommand() {
     pendingAck.commandId = commandId;
     pendingAck.success = (relayNumber >= 1 && validAction);
     pendingAck.error = pendingAck.success ? "" : "Unsupported pin or action";
+    pendingAck.lastAttempt = millis();
 
   } else {
     Serial.print("Command request failed. HTTP: ");
@@ -456,7 +471,7 @@ void setRelay(int relayNumber, bool turnOn) {
 // 13. ACKNOWLEDGE COMMAND EXECUTION
 // =====================================
 
-void acknowledgeCommand(
+bool acknowledgeCommand(
   const String& commandId,
   bool success,
   const String& errorMessage
@@ -476,7 +491,7 @@ void acknowledgeCommand(
 
   if (!http.begin(client, url)) {
     Serial.println("Could not start acknowledgment request.");
-    return;
+    return false;
   }
 
   http.setTimeout(30000);
@@ -498,15 +513,21 @@ void acknowledgeCommand(
 
   int responseCode = http.POST(body);
 
-  if (responseCode >= 200 && responseCode < 300) {
+  bool accepted = (responseCode >= 200 && responseCode < 300);
+  if (accepted) {
     Serial.println("Command acknowledgment accepted.");
   } else {
+    // -1 is HTTPC_ERROR_CONNECTION_REFUSED, usually the leftover TLS context
+    // from the poll. The main loop retries until it is accepted.
     Serial.print("Acknowledgment failed. HTTP: ");
     Serial.println(responseCode);
+    Serial.print("Free heap: ");
+    Serial.println(ESP.getFreeHeap());
   }
 
   http.end();
   client.stop();
+  return accepted;
 }
 
 // =====================================

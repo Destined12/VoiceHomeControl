@@ -1,4 +1,5 @@
 import { loadPcmWorklet, PCM_WORKLET_NAME } from './pcm-worklet';
+import { buildTranscriptionConfig } from './transcription';
 
 const LIVE_MODEL = 'gemini-3.5-transcribe-live';
 const TARGET_RATE = 16000;
@@ -194,7 +195,12 @@ export function startMicSession(callbacks: VoiceCallbacks): MicSessionController
 
       session = await ai.live.connect({
         model: LIVE_MODEL,
-        config: { responseModalities: ['TEXT'] as any },
+        config: {
+          responseModalities: ['TEXT'] as any,
+          // Mirrors the transcription config locked into the ephemeral token so
+          // the recognizer is biased toward the configured accents and terms.
+          inputAudioTranscription: buildTranscriptionConfig() as any,
+        },
         callbacks: {
           onopen: () => {},
           onmessage: (event: LiveServerMessage) => {

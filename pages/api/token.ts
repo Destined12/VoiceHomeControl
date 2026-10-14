@@ -1,6 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from 'next';
 import { GoogleGenAI } from '@google/genai';
 import { Modality } from '@google/genai';
+import { ensureSchema, query } from '../../lib/db';
+import { buildTranscriptionConfig } from '../../lib/transcription';
 
 const LIVE_MODEL = 'gemini-3.5-transcribe-live';
 const TOKEN_TTL_MS = 120_000;
@@ -18,6 +20,32 @@ function isRateLimited(key: string): boolean {
   }
   entry.count += 1;
   return entry.count > RATE_MAX;
+}
+
+type DeviceVocabularyRow = {
+  name: string;
+  location: string;
+  aliases: string | null;
+};
+
+// Best-effort: room names, device names and voice aliases are fed to the
+// recognizer so configured spaces are transcribed correctly. Voice must still
+// work when the database is unreachable, so failures fall back to no terms.
+async function loadVocabularyTerms(): Promise<string[]> {
+  try {
+    await ensureSchema();
+    const rows = await query<DeviceVocabularyRow>(
+      `SELECT name, location, aliases FROM devices WHERE pin IS NOT NULL`
+    );
+    return rows.rows.flatMap(row => [
+      row.name,
+      row.location,
+      ...(row.aliases ?? '').split(','),
+    ]);
+  } catch (error) {
+    console.error('[token] vocabulary lookup failed:', error);
+    return [];
+  }
 }
 
 function clientKey(req: NextApiRequest): string {
@@ -49,6 +77,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 
   try {
+    const vocabularyTerms = await loadVocabularyTerms();
     const ai = new GoogleGenAI({
       apiKey,
       httpOptions: { apiVersion: 'v1alpha' },
@@ -59,7 +88,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         expireTime: new Date(Date.now() + TOKEN_TTL_MS).toISOString(),
         liveConnectConstraints: {
           model: LIVE_MODEL,
-          config: { responseModalities: [Modality.TEXT] },
+          config: {
+            responseModalities: [Modality.TEXT],
+            inputAudioTranscription: buildTranscriptionConfig(vocabularyTerms),
+          },
         },
       },
     });
