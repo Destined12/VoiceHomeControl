@@ -1,3 +1,5 @@
+import { BASE_CUSTOM_VOCABULARY } from './vocabulary';
+
 export type TranscriptionConfig = {
   languageCodes: string[];
   customVocabulary: string[];
@@ -8,36 +10,14 @@ export type TranscriptionConfig = {
 // biased toward British English, the reference variety used in Nigeria.
 export const TRANSCRIBE_LANGUAGE_CODES = ['en-GB'];
 
-// Generic home/action terms. Room-specific vocabulary (device names, room
-// names and aliases) is appended at token creation time from the database.
-export const BASE_CUSTOM_VOCABULARY = [
-  'turn on',
-  'turn off',
-  'switch on',
-  'switch off',
-  'activate',
-  'deactivate',
-  'light',
-  'bulb',
-  'lamp',
-  'socket',
-  'plug',
-  'outlet',
-  'switch',
-  'sitting room',
-  'living room',
-  'parlour',
-  'bedroom',
-  'study room',
-  'kitchen',
-  'bathroom',
-  'toilet',
-  'corridor',
-  'store',
-];
+// `BASE_CUSTOM_VOCABULARY` lives in `lib/vocabulary.ts` so the synonym table
+// stays the single source of truth. Room-specific vocabulary (device names,
+// room names and aliases) is appended at token creation time from the database.
+export { BASE_CUSTOM_VOCABULARY };
 
-// Best results are typically seen with up to ~100 terms.
-const MAX_VOCABULARY_TERMS = 100;
+// Best results are typically seen with up to ~100 terms; the synonym table
+// needs a little more headroom.
+const MAX_VOCABULARY_TERMS = 150;
 
 export function buildCustomVocabulary(extra: string[] = []): string[] {
   const seen = new Set<string>();

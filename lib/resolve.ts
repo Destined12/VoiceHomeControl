@@ -1,3 +1,5 @@
+import { canonicalize } from './vocabulary';
+
 export type ResolveDevice = {
   id: string;
   name: string;
@@ -23,18 +25,40 @@ function deviceAliases(device: ResolveDevice): string[] {
     .filter(Boolean);
 }
 
+function canonicalDeviceAliases(device: ResolveDevice): string[] {
+  return deviceAliases(device).map(alias => canonicalize(alias)).filter(Boolean);
+}
+
+function matchDevices(
+  text: string,
+  devices: ResolveDevice[],
+  aliasesOf: (device: ResolveDevice) => string[]
+): ResolveDevice[] {
+  return devices.filter(device => aliasesOf(device).some(alias => text.includes(alias)));
+}
+
+const ON_PATTERN = /\b(on|turn on|switch on|activate|enable|start|illuminate|energise)\b/;
+const OFF_PATTERN = /\b(off|turn off|switch off|deactivate|disable|stop|extinguish|disconnect)\b/;
+const SOCKET_PATTERN = /\b(socket|plug|outlet)\b/;
+
 export function resolveCommand(text: string, devices: ResolveDevice[]): ResolvedCommand {
   const normalized = text.toLowerCase();
-  const action: 'ON' | 'OFF' | 'UNKNOWN' = /\b(on|turn on|switch on|activate)\b/.test(normalized)
+  // Canonical terms drive action and device-type detection so synonyms such as
+  // "lounge light" or "power point" behave like their canonical counterparts.
+  const canonical = canonicalize(text);
+
+  const action: 'ON' | 'OFF' | 'UNKNOWN' = ON_PATTERN.test(canonical)
     ? 'ON'
-    : /\b(off|turn off|switch off|deactivate)\b/.test(normalized)
+    : OFF_PATTERN.test(canonical)
       ? 'OFF'
       : 'UNKNOWN';
 
-  const matches = devices.filter(device => {
-    const aliases = deviceAliases(device);
-    return aliases.some(alias => normalized.includes(alias));
-  });
+  // Prefer matching the user's literal room/device wording first, then fall
+  // back to canonical terms so user-defined spaces always win.
+  let matches = matchDevices(normalized, devices, deviceAliases);
+  if (!matches.length && canonical !== normalized) {
+    matches = matchDevices(canonical, devices, canonicalDeviceAliases);
+  }
 
   if (!matches.length || action === 'UNKNOWN') {
     return { action, device_id: null, device: null, pin: null };
@@ -42,7 +66,7 @@ export function resolveCommand(text: string, devices: ResolveDevice[]): Resolved
 
   const space = matches[0].location;
   const candidates = matches.filter(device => device.location === space);
-  const wantsSocket = /\b(socket|plug|outlet)\b/.test(normalized);
+  const wantsSocket = SOCKET_PATTERN.test(canonical);
   const preferred = candidates.filter(device => isSocketName(device.name) === wantsSocket);
   const picked = preferred[0] || candidates[0];
 
